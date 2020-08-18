@@ -11,13 +11,20 @@ async fn index() -> actix_web::Result<NamedFile> {
 /// Handle a login request by getting a basic auth header from the
 /// incoming request and verifying those credentials.
 async fn login(id: Identity, req: HttpRequest) -> HttpResponse {
-    let auth_header = req.headers().get(header::AUTHORIZATION).unwrap();
-    let hd = auth_header.to_str().unwrap();
-    let mut pieces: Vec<&str> = hd.split(' ').collect();
-    let encoded = pieces[1];
-    let decoded = String::from_utf8(base64::decode(encoded).unwrap()).unwrap();
-    pieces = decoded.split(':').collect();
-    let user = pieces[0].to_string();
+    let token = 
+        req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(' ')
+            .last()
+            .unwrap();
+
+    let decoded_token = String::from_utf8(base64::decode(token).unwrap()).unwrap();
+    let mut token_data = decoded_token.split(":");
+    let user = token_data.next().unwrap().to_owned();
 
     /* Check basic auth credentials are ok.
     this process may take a few seconds...
@@ -35,8 +42,14 @@ async fn login(id: Identity, req: HttpRequest) -> HttpResponse {
 
     /* add a secure cookie to the http response */
     println!("Logging in user: {}", user);
-    id.remember(user);
+    id.remember(user.clone());
 
+    HttpResponse::Ok().body(user)
+}
+
+async fn logout(id: Identity) -> HttpResponse {
+    id.forget();
+    println!("User logged out");
     HttpResponse::Ok().finish()
 }
 
@@ -67,7 +80,8 @@ async fn main() -> Result<()> {
             .service(
                 web::scope("/auth")
                     .route("/check", web::get().to(check_login))
-                    .route("/login", web::get().to(login)),
+                    .route("/login", web::get().to(login))
+                    .route("/logout", web::get().to(logout))
             )
             .service(Files::new("/pkg", "./client/pkg"))
             .default_service(web::get().to(index))

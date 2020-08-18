@@ -1,27 +1,40 @@
 use seed::{prelude::*, *};
 
+// Paths
+const LOGIN: &str = "login";
+
 // ------ ------
 //     Init
 // ------ ------
 
 fn init(url: Url, orders: &mut impl Orders<Msg>) -> Model {
-    orders.subscribe(Msg::UrlChanged);
-    let model = Model {
+    orders
+        .subscribe(Msg::UrlChanged)
+        .send_msg(Msg::CheckAuth);
+
+    let user = User::Loading;
+    Model {
         base_url: url.to_base_url(),
-        page: Page::for_url(url),
-        user: None,
-    };
-
-    if model.user.is_none() {
-        orders.send_msg(Msg::CheckAuth);
+        page: Page::init(url, &user),
+        user,
     }
-
-    model
 }
 
 // ------ ------
 //     Model
 // ------ ------
+
+struct Model {
+    base_url: Url,
+    page: Page,
+    user: User,
+}
+
+enum User {
+    Anonymous,
+    Loading,
+    Loaded(String),
+}
 
 // The idea is to follow the same pattern as the seed
 // auth example.  Only, instead of getting a LoggedUser
@@ -37,22 +50,26 @@ enum Page {
 }
 
 impl Page {
-    fn for_url(mut url: Url) -> Self {
-        match url.next_path_part() {
-            None => Self::Dashboard,
-            Some("login") => Self::Login {
-                username: Default::default(),
-                password: Default::default(),
-            },
-            Some(_) => Self::NotFound,
+    fn init(mut url: Url, user: &User) -> Self {
+        match user {
+            User::Anonymous => {
+                Self::Login {
+                    username: String::new(),
+                    password: String::new(),
+                }
+            }
+            User::Loading | User::Loaded(_) => {
+                match url.next_path_part() {
+                    None => Self::Dashboard,
+                    Some(LOGIN) => Self::Login {
+                        username: String::new(),
+                        password: String::new(),
+                    },
+                    Some(_) => Self::NotFound,
+                }
+            }
         }
     }
-}
-
-struct Model {
-    base_url: Url,
-    page: Page,
-    user: Option<String>,
 }
 
 // ------ ------
@@ -64,6 +81,9 @@ impl<'a> Urls<'a> {
     pub fn home(self) -> Url {
         self.base_url()
     }
+    pub fn login(self) -> Url {
+        self.base_url().add_path_part(LOGIN)
+    }
 }
 
 // ------ ------
@@ -73,7 +93,6 @@ impl<'a> Urls<'a> {
 enum Msg {
     // basic switching between a /login page and
     // a / home page
-    GoToUrl(Url),
     UrlChanged(subs::UrlChanged),
 
     // /auth/login messages
@@ -81,6 +100,8 @@ enum Msg {
     UpdateLoginPass(String),
     Login,
     LoginResponse(fetch::Result<String>),
+    Logout,
+    LogoutResponse(fetch::Result<()>),
 
     // /auth/check messages
     CheckAuth,
@@ -89,24 +110,8 @@ enum Msg {
 
 fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
     match msg {
-        Msg::GoToUrl(url) => {
-            orders.notify(subs::UrlRequested::new(url));
-        }
         Msg::UrlChanged(subs::UrlChanged(url)) => {
-            // the idea here is to prevent a non-logged-in
-            // user from going anywhere but the login screen.
-            // This _may_ be the root of my problem (???);
-            // my app is triggering browser refreshes that
-            // are mysterious to me...
-            if model.user.is_some() {
-                model.page = Page::for_url(url);
-            } else if url.path().is_empty() {
-                orders.send_msg(Msg::CheckAuth);
-            } else if url.path()[0] != "login" {
-                orders.send_msg(Msg::GoToUrl(model.base_url.clone().add_path_part("login")));
-            } else {
-                model.page = Page::for_url(url);
-            }
+            model.page = Page::init(url, &model.user);
         }
         Msg::CheckAuth => {
             // check with the server whether or not we have
@@ -133,74 +138,59 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
         Msg::AuthStatus(Ok(user)) => {
             log!("auth status ok:", user);
             if user.is_empty() {
-                model.user = None;
-                orders.send_msg(Msg::GoToUrl(model.base_url.clone().add_path_part("login")));
+                model.user = User::Anonymous;
+                request_url(Urls::new(&model.base_url).login(), orders);
             } else {
-                model.user = Some(user);
-                orders.send_msg(Msg::GoToUrl(model.base_url.clone()));
+                model.user = User::Loaded(user);
             }
         }
         Msg::AuthStatus(Err(e)) => {
             #[cfg(debug_assertions)]
             log!("Error checking auth:", e);
-            model.user = None;
-            orders.send_msg(Msg::GoToUrl(model.base_url.clone().add_path_part("login")));
+            model.user = User::Anonymous;
+            request_url(Urls::new(&model.base_url).login(), orders);
         }
         Msg::UpdateLoginUser(user) => {
-            if let Model {
-                page: Page::Login { username, .. },
-                ..
-            } = model
-            {
+            if let Page::Login { username, ..} = &mut model.page {
                 *username = user;
             }
         }
         Msg::UpdateLoginPass(pass) => {
-            if let Model {
-                page: Page::Login { password, .. },
-                ..
-            } = model
-            {
+            if let Page::Login { password, ..} = &mut model.page {
                 *password = pass;
             }
         }
         Msg::Login => {
-            if let Model {
-                page: Page::Login {
-                    username, password, ..
-                },
-                ..
-            } = model
-            {
-                let username = username.clone();
-                let password = password.clone();
+            let (username, password) = match &model.page {
+                Page::Login { username, password, ..} => (username.clone(), password.clone()),
+                _ => return
+            };
 
-                // Here is where the problem appears to be.  I want the
-                // app to wait until it has a LoginResponse from the server
-                // before doing _anything_.  Yet things happen immediately
-                // after login is clicked -- the page refreshes, and auth
-                // status is check again _before_ any response from the server
-                // has arrived!  I don't understand why!  Any help explaining
-                // this would be appreciated...
-                orders.perform_cmd(async move {
-                    Msg::LoginResponse(
-                        async {
-                            Request::new("/auth/login")
-                                .header(Header::authorization(format!(
-                                    "Basic {}",
-                                    base64::encode(format!("{}:{}", username, password))
-                                )))
-                                .timeout(5_000)
-                                .fetch()
-                                .await?
-                                .check_status()?
-                                .text()
-                                .await
-                        }
-                        .await,
-                    )
-                });
-            }
+            // Here is where the problem appears to be.  I want the
+            // app to wait until it has a LoginResponse from the server
+            // before doing _anything_.  Yet things happen immediately
+            // after login is clicked -- the page refreshes, and auth
+            // status is check again _before_ any response from the server
+            // has arrived!  I don't understand why!  Any help explaining
+            // this would be appreciated...
+            orders.perform_cmd(async move {
+                Msg::LoginResponse(
+                    async {
+                        Request::new("/auth/login")
+                            .header(Header::authorization(format!(
+                                "Basic {}",
+                                base64::encode(format!("{}:{}", username, password))
+                            )))
+                            .timeout(5_000)
+                            .fetch()
+                            .await?
+                            .check_status()?
+                            .text()
+                            .await
+                    }
+                    .await,
+                )
+            });
         }
         Msg::LoginResponse(Ok(user)) => {
             // If there is an Ok response from out login request, great!
@@ -210,20 +200,46 @@ fn update(msg: Msg, model: &mut Model, orders: &mut impl Orders<Msg>) {
             // log in again.
             log!("auth status ok:", user);
             if user.is_empty() {
-                model.user = None;
-                orders.send_msg(Msg::GoToUrl(model.base_url.clone().add_path_part("login")));
+                model.user = User::Anonymous;
+                request_url(Urls::new(&model.base_url).login(), orders);
             } else {
-                model.user = Some(user);
-                orders.send_msg(Msg::GoToUrl(model.base_url.clone()));
+                model.user = User::Loaded(user);
+                request_url(Urls::new(&model.base_url).home(), orders);
             }
         }
         Msg::LoginResponse(Err(e)) => {
             #[cfg(debug_assertions)]
             log!("Error checking auth:", e);
-            model.user = None;
-            orders.send_msg(Msg::GoToUrl(model.base_url.clone().add_path_part("login")));
+            model.user = User::Anonymous;
+            request_url(Urls::new(&model.base_url).login(), orders);
+        }
+        Msg::Logout => {
+            orders.perform_cmd(async move {
+                Msg::LogoutResponse(
+                    async {
+                        Request::new("/auth/logout")
+                            .fetch()
+                            .await?
+                            .check_status()?;
+                        Ok(())
+                    }
+                    .await,
+                )
+            });
+        }
+        Msg::LogoutResponse(Ok(())) => {
+            log!("User has been logged out.");
+            model.user = User::Anonymous;
+            request_url(Urls::new(&model.base_url).login(), orders);
+        }
+        Msg::LogoutResponse(Err(e)) => {
+            error!("Log out failed:", e);
         }
     }
+}
+
+fn request_url(url: Url, orders: &mut impl Orders<Msg>) {
+    orders.notify(subs::UrlRequested::new(url));
 }
 
 // ------ ------
@@ -237,6 +253,10 @@ fn view(model: &Model) -> Node<Msg> {
         } => div![
             h1!["Login"],
             form![
+                ev(Ev::Submit, move |event| {
+                    event.prevent_default();
+                    Msg::Login
+                }),
                 label!["Enter your email:"],
                 input![
                     attrs! {
@@ -254,19 +274,16 @@ fn view(model: &Model) -> Node<Msg> {
                     },
                     input_ev(Ev::Input, Msg::UpdateLoginPass),
                 ],
-                button!["Log In", ev(Ev::Click, |_| Msg::Login),],
+                button!["Log In"],
             ],
         ],
         Page::Dashboard => {
-            if let Model {
-                user: Some(user), ..
-            } = model
-            {
+            if let User::Loaded(user) = &model.user {
                 div![
                     h1![format!("{} 's Dashboard", user)],
                     button![
                         "Log Out",
-                        // ev(Ev::Click, |_| Msg::Logout),
+                        ev(Ev::Click, |_| Msg::Logout),
                     ],
                 ]
             } else {
